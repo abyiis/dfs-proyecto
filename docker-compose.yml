@@ -1,0 +1,127 @@
+version: '3.9'
+
+networks:
+  dfs_net:
+    driver: bridge
+
+volumes:
+  namenode_data:
+  dn1_data:
+  dn2_data:
+  dn3_data:
+
+services:
+
+  # ── NameNode ────────────────────────────────────────────────────────────────
+  namenode:
+    build:
+      context: .
+      dockerfile: namenode/Dockerfile
+    container_name: namenode
+    hostname: namenode
+    environment:
+      BLOCK_SIZE:          "67108864"   # 64 MB
+      REPLICATION_FACTOR:  "2"
+      HEARTBEAT_TIMEOUT:   "90"
+      NAMENODE_PORT:       "50051"
+      DB_PATH:             "/data/namenode.db"
+    ports:
+      - "50051:50051"
+    volumes:
+      - namenode_data:/data
+    networks:
+      - dfs_net
+    restart: unless-stopped
+
+  # ── DataNode 1 ──────────────────────────────────────────────────────────────
+  datanode1:
+    build:
+      context: .
+      dockerfile: datanode/Dockerfile
+    container_name: datanode1
+    hostname: datanode1
+    environment:
+      DATANODE_ID:    "dn1"
+      DATANODE_ADDR:  "datanode1:50052"
+      DATANODE_PORT:  "50052"
+      NAMENODE_ADDR:  "namenode:50051"
+      STORAGE_DIR:    "/data/blocks"
+      HB_INTERVAL:    "30"
+    ports:
+      - "50052:50052"
+    volumes:
+      - dn1_data:/data/blocks
+    networks:
+      - dfs_net
+    depends_on:
+      - namenode
+    restart: unless-stopped
+
+  # ── DataNode 2 ──────────────────────────────────────────────────────────────
+  datanode2:
+    build:
+      context: .
+      dockerfile: datanode/Dockerfile
+    container_name: datanode2
+    hostname: datanode2
+    environment:
+      DATANODE_ID:    "dn2"
+      DATANODE_ADDR:  "datanode2:50053"
+      DATANODE_PORT:  "50053"
+      NAMENODE_ADDR:  "namenode:50051"
+      STORAGE_DIR:    "/data/blocks"
+      HB_INTERVAL:    "30"
+    ports:
+      - "50053:50053"
+    volumes:
+      - dn2_data:/data/blocks
+    networks:
+      - dfs_net
+    depends_on:
+      - namenode
+    restart: unless-stopped
+
+  # ── DataNode 3 ──────────────────────────────────────────────────────────────
+  datanode3:
+    build:
+      context: .
+      dockerfile: datanode/Dockerfile
+    container_name: datanode3
+    hostname: datanode3
+    environment:
+      DATANODE_ID:    "dn3"
+      DATANODE_ADDR:  "datanode3:50054"
+      DATANODE_PORT:  "50054"
+      NAMENODE_ADDR:  "namenode:50051"
+      STORAGE_DIR:    "/data/blocks"
+      HB_INTERVAL:    "30"
+    ports:
+      - "50054:50054"
+    volumes:
+      - dn3_data:/data/blocks
+    networks:
+      - dfs_net
+    depends_on:
+      - namenode
+    restart: unless-stopped
+
+  # ── Client (interactivo) ────────────────────────────────────────────────────
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    container_name: dfs_client
+    environment:
+      NAMENODE_ADDR: "namenode:50051"
+      BLOCK_SIZE:    "67108864"
+    volumes:
+      - ./test_files:/files          # monta archivos de prueba locales
+    networks:
+      - dfs_net
+    depends_on:
+      - namenode
+      - datanode1
+      - datanode2
+      - datanode3
+    stdin_open: true
+    tty: true

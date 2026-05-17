@@ -1,0 +1,84 @@
+syntax = "proto3";
+package dfs;
+
+// ─── NameNode ────────────────────────────────────────────────────────────────
+
+service NameNode {
+  rpc Authenticate  (AuthRequest)    returns (AuthResponse);
+  rpc PutInit       (PutRequest)     returns (PutResponse);
+  rpc GetInfo       (GetRequest)     returns (GetResponse);
+  rpc ListDir       (ListRequest)    returns (ListResponse);
+  rpc Remove        (RemoveRequest)  returns (StatusResponse);
+  rpc MakeDir       (MkdirRequest)   returns (StatusResponse);
+  rpc Heartbeat     (HeartbeatRequest) returns (HeartbeatResponse);
+  rpc BlockReport   (BlockReportRequest) returns (StatusResponse);
+}
+
+message AuthRequest  { string username = 1; string password = 2; }
+message AuthResponse { bool ok = 1; string token = 2; string message = 3; }
+
+message BlockAssignment {
+  string block_id    = 1;
+  int32  block_index = 2;
+  repeated string datanode_addresses = 3;
+}
+
+message PutRequest {
+  string token     = 1;
+  string filename  = 2;
+  int64  file_size = 3;
+  int32  num_blocks = 4;
+}
+message PutResponse {
+  bool ok = 1;
+  repeated BlockAssignment assignments = 2;
+  string message = 3;
+}
+
+message GetRequest  { string token = 1; string filename = 2; }
+message GetResponse {
+  bool ok = 1;
+  repeated BlockAssignment assignments = 2;
+  int64 file_size = 3;
+  string message = 4;
+}
+
+message ListRequest  { string token = 1; string path = 2; }
+message ListResponse { bool ok = 1; repeated string entries = 2; }
+
+message RemoveRequest  { string token = 1; string filename = 2; }
+message MkdirRequest   { string token = 1; string path = 2; }
+message StatusResponse { bool ok = 1; string message = 2; }
+
+message HeartbeatRequest {
+  string datanode_id      = 1;
+  string address          = 2;
+  int64  free_bytes       = 3;
+  int32  block_count      = 4;
+}
+message HeartbeatResponse { bool ok = 1; }
+
+message BlockReportRequest {
+  string datanode_id   = 1;
+  repeated string block_ids = 2;
+}
+
+// ─── DataNode ────────────────────────────────────────────────────────────────
+
+service DataNode {
+  rpc StoreBlock    (stream BlockChunk)  returns (StoreAck);
+  rpc RetrieveBlock (RetrieveRequest)   returns (stream BlockChunk);
+  rpc DeleteBlock   (BlockRequest)      returns (StatusResponse);
+  rpc HasBlock      (BlockRequest)      returns (StatusResponse);
+}
+
+message BlockChunk {
+  string block_id   = 1;
+  bytes  data       = 2;
+  bool   is_last    = 3;
+  string checksum   = 4;
+  repeated string replicate_to = 5;  // pipeline: next DataNodes to replicate
+}
+message StoreAck     { bool ok = 1; string block_id = 2; string message = 3; }
+message RetrieveRequest { string block_id = 1; }
+message BlockRequest    { string block_id = 1; }
