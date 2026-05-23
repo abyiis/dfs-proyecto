@@ -2,7 +2,7 @@
 **Juan David Parra Sierra | UPB 2026**
 
 Sistema de archivos distribuido minimalista con NameNode central, 3 DataNodes y
-replicación pipeline. Stack: Python 3.12 + gRPC + SQLite + Docker Compose.
+replicación pipeline. Stack: Python 3.12 + gRPC + SQLAlchemy + SQLite + Docker Compose.
 
 ---
 
@@ -11,13 +11,13 @@ replicación pipeline. Stack: Python 3.12 + gRPC + SQLite + Docker Compose.
 ```
 dfs/
 ├── proto/
-│   └── dfs.proto              # Definición de servicios gRPC
+│   └── dfs.proto              # Definición de servicios gRPC (NameNode + DataNode)
 ├── namenode/
 │   ├── Dockerfile
-│   └── server.py              # NameNode: metadatos + asignación de bloques
+│   └── server.py              # NameNode: metadatos (SQLite), tokens, self-healing
 ├── datanode/
 │   ├── Dockerfile
-│   └── server.py              # DataNode: almacenamiento + heartbeat + replicación
+│   └── server.py              # DataNode: almacenamiento + heartbeat + replicación pipeline
 ├── client/
 │   ├── Dockerfile
 │   └── cli.py                 # CLI: auth / put / get / ls / rm
@@ -56,9 +56,9 @@ Esperar ~10 segundos a que los DataNodes envíen el primer heartbeat al NameNode
 Deberías ver en los logs:
 
 ```
-namenode  | [NameNode] Listening on :50051
-datanode1 | [DataNode:dn1] Listening on :50052
-datanode1 | [HB] dn1 @ datanode1:50052 | free=...MB blocks=0
+namenode  | [NameNode Activo] Escuchando peticiones gRPC en puerto :50051
+datanode1 | [DataNode Ejecutándose] Corriendo en el puerto físico :50052
+datanode1 | [HB] datanode1:50052 | free=...MB blocks=0
 ```
 
 ---
@@ -128,7 +128,7 @@ docker compose start datanode1
 ## 5. Ver estado del clúster
 
 ```bash
-# Logs del NameNode (heartbeats, asignaciones)
+# Logs del NameNode (heartbeats, asignaciones, self-healing)
 docker compose logs namenode
 
 # Logs de un DataNode específico
@@ -159,12 +159,12 @@ docker compose down -v
 
 ## Variables de entorno configurables
 
-| Variable            | Default      | Descripción                          |
-|---------------------|--------------|--------------------------------------|
-| `BLOCK_SIZE`        | 67108864     | Tamaño de bloque en bytes (64 MB)    |
-| `REPLICATION_FACTOR`| 2            | Número de réplicas por bloque        |
-| `HEARTBEAT_TIMEOUT` | 90           | Segundos sin HB para declarar nodo muerto |
-| `HB_INTERVAL`       | 30           | Intervalo de heartbeat en segundos   |
+| Variable            | Default      | Descripción                                        |
+|---------------------|--------------|----------------------------------------------------|
+| `BLOCK_SIZE`        | 67108864     | Tamaño de bloque en bytes (64 MB)                  |
+| `REPLICATION_FACTOR`| 2            | Número de réplicas por bloque                      |
+| `HEARTBEAT_TIMEOUT` | 15           | Segundos sin HB para declarar nodo muerto          |
+| `HB_INTERVAL`       | 4            | Intervalo de heartbeat en segundos                 |
 
 Para cambiar un valor, editar `docker-compose.yml` en la sección `environment` del servicio correspondiente y hacer `docker compose up -d --build`.
 
@@ -183,5 +183,6 @@ Para cambiar un valor, editar `docker-compose.yml` en la sección `environment` 
 
 - **Cliente ↔ NameNode**: gRPC unario (auth, put-init, get-info, ls, rm)
 - **Cliente ↔ DataNode**: gRPC streaming (transferencia de bloques en chunks de 1 MB)
-- **DataNode ↔ NameNode**: gRPC unario (heartbeat cada 30s, block report al arrancar)
-- **DataNode ↔ DataNode**: gRPC streaming (replicación pipeline)
+- **DataNode ↔ NameNode**: gRPC unario (heartbeat cada 4s, block report cada 12s)
+- **DataNode ↔ DataNode**: gRPC streaming (replicación pipeline, iniciada por el nodo origen)
+- **Self-Healing**: hilo monitor en NameNode detecta caídas (cada 5s) y re-replica bloques huérfanos
