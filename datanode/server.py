@@ -39,7 +39,7 @@ def sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-# ─── Loops Asíncronos de Comunicación (Heartbeat & Reportes) ──────────────────
+# ─── Loops Asíncronos de Comunicación ─────────────────────────────────────────
 def _heartbeat_loop():
     while True:
         try:
@@ -68,26 +68,27 @@ def _block_report_loop():
 threading.Thread(target=_heartbeat_loop, daemon=True).start()
 threading.Thread(target=_block_report_loop, daemon=True).start()
 
-# ─── Servicer DataNode con Escritura Segura de Bloques ────────────────────────
+# ─── Servicer DataNode con Fix de Integridad por Integración SHA-256 ───────────
 class DataNodeServicer(dfs_pb2_grpc.DataNodeServicer):
 
     def StoreBlock(self, request_iterator, ctx):
-        block_id = None
-        tmp_path = None
-        replicate_to = []
-        file_handler = None
+        block_id          = None
+        tmp_path          = None
+        replicate_to      = []
+        file_handler      = None
+        received_checksum = ''
 
         try:
             for chunk in request_iterator:
                 if block_id is None:
                     block_id = chunk.block_id
                     replicate_to = list(chunk.replicate_to)
-                    # Arreglo crítico: Archivo temporal único y aislado por hilo
                     tmp_path = Path(f'/tmp/_dfs_{block_id}_{threading.get_ident()}.tmp')
                     file_handler = open(tmp_path, 'wb')
                 
                 file_handler.write(chunk.data)
                 if chunk.is_last:
+                    received_checksum = chunk.checksum
                     break
 
             if file_handler:
@@ -99,13 +100,22 @@ class DataNodeServicer(dfs_pb2_grpc.DataNodeServicer):
             final = block_path(block_id)
             tmp_path.rename(final)
             
-            print(f'[Físico Guardado] Bloque: {block_id[:8]} -> Completado con éxito.', flush=True)
+            # Fix Medio: Verificación estricta de firma criptográfica
+            actual_checksum = sha256_file(final)
+            if received_checksum and received_checksum != actual_checksum:
+                final.unlink()
+                raise Exception(
+                    f'Corrupción detectada: checksum esperado={received_checksum[:12]} '
+                    f'obtenido={actual_checksum[:12]}'
+                )
+
+            print(f'[Físico Guardado] Bloque: {block_id[:8]} checksum={actual_checksum[:12]} OK', flush=True)
 
             # Replicación en Pipeline (Transmisión Directa entre DataNodes)
             if replicate_to:
                 next_node = replicate_to[0]
                 rem = replicate_to[1:]
-                self._replicate(block_id, final, next_node, rem)
+                self._replicate(block_id, final, next_node, rem, actual_checksum)
 
             return dfs_pb2.StoreAck(ok=True, block_id=block_id)
 
@@ -114,7 +124,7 @@ class DataNodeServicer(dfs_pb2_grpc.DataNodeServicer):
             if tmp_path and tmp_path.exists(): tmp_path.unlink()
             return dfs_pb2.StoreAck(ok=False, block_id=block_id or '', message=str(e))
 
-    def _replicate(self, block_id, path, next_addr, remaining):
+    def _replicate(self, block_id, path, next_addr, remaining, checksum):
         def gen():
             with open(path, 'rb') as f:
                 while True:
@@ -122,7 +132,8 @@ class DataNodeServicer(dfs_pb2_grpc.DataNodeServicer):
                     if not data: break
                     yield dfs_pb2.BlockChunk(
                         block_id=block_id, data=data,
-                        is_last=len(data) < CHUNK_SIZE, replicate_to=remaining
+                        is_last=len(data) < CHUNK_SIZE, replicate_to=remaining,
+                        checksum=checksum
                     )
         try:
             ch = grpc.insecure_channel(next_addr)
@@ -137,11 +148,15 @@ class DataNodeServicer(dfs_pb2_grpc.DataNodeServicer):
             ctx.abort(grpc.StatusCode.NOT_FOUND, f'Bloque {req.block_id} inexistente.')
             return
         
+        checksum = sha256_file(path)
         with open(path, 'rb') as f:
             while True:
                 data = f.read(CHUNK_SIZE)
                 if not data: break
-                yield dfs_pb2.BlockChunk(block_id=req.block_id, data=data, is_last=len(data) < CHUNK_SIZE)
+                yield dfs_pb2.BlockChunk(
+                    block_id=req.block_id, data=data, 
+                    is_last=len(data) < CHUNK_SIZE, checksum=checksum
+                )
 
     def DeleteBlock(self, req, ctx):
         path = block_path(req.block_id)

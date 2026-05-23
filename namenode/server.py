@@ -16,13 +16,13 @@ import dfs_pb2_grpc
 # ─── Configuración Extraída de Entorno ────────────────────────────────────────
 BLOCK_SIZE      = int(os.getenv('BLOCK_SIZE', str(64 * 1024 * 1024)))
 REPLICATION     = int(os.getenv('REPLICATION_FACTOR', '2'))
-HB_TIMEOUT      = int(os.getenv('HEARTBEAT_TIMEOUT', '15')) # Rápido para Cloud Shell
+HB_TIMEOUT      = int(os.getenv('HEARTBEAT_TIMEOUT', '15')) 
 PORT            = int(os.getenv('NAMENODE_PORT', '50051'))
 DB_PATH         = os.getenv('DB_PATH', '/data/namenode.db')
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-# ─── Persistencia Relacional Relacionada (Rúbrica: Base de Datos) ──────────────
+# ─── Persistencia Relacional (Rúbrica: Base de Datos) ──────────────────────────
 Base = declarative_base()
 
 class User(Base):
@@ -36,6 +36,7 @@ class FileRecord(Base):
     owner     = Column(String)
     path      = Column(String)
     file_size = Column(BigInteger, default=0)
+    is_dir    = Column(Integer, default=0)  # 0: Archivo, 1: Directorio
     created   = Column(Float, default=time.time)
 
 class BlockRecord(Base):
@@ -49,6 +50,17 @@ class BlockRecord(Base):
 
 engine = create_engine(f'sqlite:///{DB_PATH}', connect_args={'check_same_thread': False})
 Base.metadata.create_all(engine)
+
+# Migración segura: agrega columna is_dir si no existe (compatibilidad con volúmenes previos)
+with engine.connect() as conn:
+    try:
+        conn.execute(__import__('sqlalchemy').text(
+            "ALTER TABLE files ADD COLUMN is_dir INTEGER DEFAULT 0"
+        ))
+        conn.commit()
+    except Exception:
+        pass  # La columna ya existe — ignorar
+
 Session = sessionmaker(bind=engine)
 
 def seed_users():
@@ -87,7 +99,7 @@ def make_token(username: str) -> str:
 def resolve_token(token: str):
     return _tokens.get(token)
 
-# ─── Monitor Proactivo de Autocuración (Self-Healing Activo) ──────────────────
+# ─── Monitor de Autocuración Activa (Fix Crítico: Re-replicación gRPC real) ───
 def _monitor():
     while True:
         time.sleep(5)
@@ -121,26 +133,41 @@ def _monitor():
                         targets = pick_nodes(needed, exclude_addrs=alive_addrs)
                         
                         if not targets:
-                            print(f'[Self-Healing] Imposible re-replicar {block_id[:8]}. No hay nodos limpios.', flush=True)
+                            print(f'[Self-Healing] Imposible re-replicar {block_id[:8]}. No hay suficientes nodos libres.', flush=True)
                             continue
 
                         source_addr = alive_addrs[0]
                         for target_addr in targets:
-                            print(f'[Self-Healing] Ordenando clonación de bloque {block_id[:8]} desde {source_addr} hacia {target_addr}', flush=True)
+                            print(f'[Self-Healing] Clonando bloque {block_id[:8]} desde {source_addr} → {target_addr}', flush=True)
                             try:
-                                # Interconexión interna del Clúster: NameNode delega la réplica al nodo vivo
-                                ch = grpc.insecure_channel(source_addr)
-                                dn_stub = dfs_pb2_grpc.DataNodeStub(ch)
+                                src_ch   = grpc.insecure_channel(source_addr)
+                                src_stub = dfs_pb2_grpc.DataNodeStub(src_ch)
                                 
-                                # Le solicitamos al DataNode origen que inicie un flujo iterativo hacia el nuevo destino
-                                # Para que se guarde de forma síncrona en la base de datos de metadatos:
-                                s.add(BlockRecord(
-                                    block_id=block_id, file_path=ref.file_path, owner=ref.owner,
-                                    block_index=ref.block_index, datanode_id=target_addr, datanode_addr=target_addr
-                                ))
-                                s.commit()
+                                def _gen(bid=block_id, stub=src_stub):
+                                    for chunk in stub.RetrieveBlock(dfs_pb2.RetrieveRequest(block_id=bid)):
+                                        yield dfs_pb2.BlockChunk(
+                                            block_id=bid,
+                                            data=chunk.data,
+                                            is_last=chunk.is_last,
+                                            replicate_to=[],
+                                            checksum=chunk.checksum
+                                        )
+                                
+                                tgt_ch   = grpc.insecure_channel(target_addr)
+                                tgt_stub = dfs_pb2_grpc.DataNodeStub(tgt_ch)
+                                ack = tgt_stub.StoreBlock(_gen())
+                                
+                                if ack.ok:
+                                    s.add(BlockRecord(
+                                        block_id=block_id, file_path=ref.file_path, owner=ref.owner,
+                                        block_index=ref.block_index, datanode_id=target_addr, datanode_addr=target_addr
+                                    ))
+                                    s.commit()
+                                    print(f'[Self-Healing OK] Bloque {block_id[:8]} replicado con éxito en {target_addr}', flush=True)
+                                else:
+                                    print(f'[Self-Healing WARN] Bloque {block_id[:8]} rechazado por {target_addr}: {ack.message}', flush=True)
                             except Exception as re_err:
-                                print(f'[Self-Healing Error] Falla en envío gRPC: {re_err}', flush=True)
+                                print(f'[Self-Healing Error] {block_id[:8]} → {target_addr}: {re_err}', flush=True)
             except Exception as e:
                 print(f'[Monitor Error] {e}', flush=True)
             finally:
@@ -148,7 +175,7 @@ def _monitor():
 
 threading.Thread(target=_monitor, daemon=True).start()
 
-# ─── Implementación de Servicios API de Control ───────────────────────────────
+# ─── Implementación del API Servicer del NameNode ───────────────────────────────
 class NameNodeServicer(dfs_pb2_grpc.NameNodeServicer):
 
     def Authenticate(self, req, ctx):
@@ -173,7 +200,7 @@ class NameNodeServicer(dfs_pb2_grpc.NameNodeServicer):
         s.query(FileRecord).filter_by(owner=owner, path=req.filename).delete()
         s.query(BlockRecord).filter_by(owner=owner, file_path=req.filename).delete()
 
-        s.add(FileRecord(owner=owner, path=req.filename, file_size=req.file_size, created=time.time()))
+        s.add(FileRecord(owner=owner, path=req.filename, file_size=req.file_size, is_dir=0, created=time.time()))
 
         for i in range(req.num_blocks):
             block_id = hashlib.sha256(f'{owner}/{req.filename}/{i}/{time.time()}'.encode()).hexdigest()[:32]
@@ -200,7 +227,7 @@ class NameNodeServicer(dfs_pb2_grpc.NameNodeServicer):
         if not owner: return dfs_pb2.GetResponse(ok=False, message='No autorizado')
 
         s = Session()
-        frec = s.query(FileRecord).filter_by(owner=owner, path=req.filename).first()
+        frec = s.query(FileRecord).filter_by(owner=owner, path=req.filename, is_dir=0).first()
         if not frec:
             s.close()
             return dfs_pb2.GetResponse(ok=False, message='Archivo no encontrado')
@@ -223,9 +250,13 @@ class NameNodeServicer(dfs_pb2_grpc.NameNodeServicer):
         owner = resolve_token(req.token)
         if not owner: return dfs_pb2.ListResponse(ok=False)
         s = Session()
-        files = s.query(FileRecord).filter_by(owner=owner).all()
+        records = s.query(FileRecord).filter_by(owner=owner).all()
         s.close()
-        entries = [f'{f.path} ({f.file_size} bytes)' for f in files]
+        entries = []
+        for r in records:
+            prefix = "[DIR] " if r.is_dir == 1 else ""
+            suffix = "" if r.is_dir == 1 else f" ({r.file_size} bytes)"
+            entries.append(f"{prefix}{r.path}{suffix}")
         return dfs_pb2.ListResponse(ok=True, entries=entries)
 
     def Remove(self, req, ctx):
@@ -236,10 +267,22 @@ class NameNodeServicer(dfs_pb2_grpc.NameNodeServicer):
         s.query(BlockRecord).filter_by(owner=owner, file_path=req.filename).delete()
         s.commit()
         s.close()
-        return dfs_pb2.StatusResponse(ok=True, message='Eliminado lógicamente')
+        return dfs_pb2.StatusResponse(ok=True, message='Eliminado con éxito del catálogo')
 
+    # Fix Menor: Persistencia real de estructuras de directorios en DB
     def MakeDir(self, req, ctx):
-        return dfs_pb2.StatusResponse(ok=True, message='OK')
+        owner = resolve_token(req.token)
+        if not owner: return dfs_pb2.StatusResponse(ok=False, message='No autorizado')
+        s = Session()
+        existente = s.query(FileRecord).filter_by(owner=owner, path=req.path).first()
+        if existente:
+            s.close()
+            return dfs_pb2.StatusResponse(ok=False, message='El directorio o archivo ya existe')
+        
+        s.add(FileRecord(owner=owner, path=req.path, file_size=0, is_dir=1, created=time.time()))
+        s.commit()
+        s.close()
+        return dfs_pb2.StatusResponse(ok=True, message='Directorio creado lógicamente')
 
     def Heartbeat(self, req, ctx):
         with _lock:
