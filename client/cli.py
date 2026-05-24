@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-Mini CLI para el DFS por bloques.
-Uso:
-  python cli.py auth <user> <pass>
-  python cli.py put  <local_file> <dfs_path>
-  python cli.py get  <dfs_path> <local_file>
-  python cli.py ls
-  python cli.py rm   <dfs_path>
-"""
 import os
 import sys
 import math
@@ -25,8 +16,7 @@ TOKEN_FILE = Path('/tmp/.dfs_token')
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 def load_token() -> str:
-    if TOKEN_FILE.exists():
-        return TOKEN_FILE.read_text().strip()
+    if TOKEN_FILE.exists(): return TOKEN_FILE.read_text().strip()
     return ''
 
 def save_token(tok: str):
@@ -43,118 +33,122 @@ def dn_stub(addr: str):
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
-
-def cmd_auth(username: str, password: str):
-    resp = nn_stub().Authenticate(
-        dfs_pb2.AuthRequest(username=username, password=password))
+def cmd_auth(u, p):
+    resp = nn_stub().Authenticate(dfs_pb2.AuthRequest(username=u, password=p))
     if resp.ok:
         save_token(resp.token)
-        print(f'Autenticado como {username}. Token guardado.')
+        print('Sesión iniciada con éxito. Token guardado.')
     else:
-        print(f'Error: {resp.message}')
+        print(f'Error de acceso: {resp.message}')
         sys.exit(1)
 
 def cmd_put(local_path: str, dfs_path: str):
     token = load_token()
-    path = Path(local_path)
-    if not path.exists():
-        print(f'Archivo no encontrado: {local_path}')
+    if not token:
+        print('Error: no autenticado.')
         sys.exit(1)
 
-    file_size  = path.stat().st_size
-    num_blocks = max(1, math.ceil(file_size / BLOCK_SIZE))
-    print(f'Subiendo {path.name} ({file_size} bytes) → {num_blocks} bloque(s)')
-
-    # 1. Pedir asignación al NameNode
-    resp = nn_stub().PutInit(dfs_pb2.PutRequest(
-        token=token, filename=dfs_path,
-        file_size=file_size, num_blocks=num_blocks))
-    if not resp.ok:
-        print(f'Error NameNode: {resp.message}')
+    lp = Path(local_path)
+    if not lp.exists():
+        print(f'Archivo local no existe: {local_path}')
         sys.exit(1)
 
-    # 2. Enviar cada bloque al DataNode primario (pipeline hace el resto)
-    with open(path, 'rb') as f:
-        for assignment in resp.assignments:
-            data = f.read(BLOCK_SIZE)
-            if not data:
-                break
-            block_id  = assignment.block_id
-            addrs     = list(assignment.datanode_addresses)
-            primary   = addrs[0]
-            pipeline  = addrs[1:]  # DataNodes que el primario debe replicar
-            checksum  = sha256_bytes(data)
+    size = lp.stat().st_size
+    num_blocks = math.ceil(size / BLOCK_SIZE) or 1
 
-            print(f'  Bloque {assignment.block_index} ({len(data)} bytes) → {primary}'
-                  + (f' + replica {pipeline}' if pipeline else ''))
+    print(f'Inicializando subida: {size} bytes en {num_blocks} bloque(s)…')
+    init_resp = nn_stub().PutInit(dfs_pb2.PutRequest(
+        token=token, filename=dfs_path, file_size=size, num_blocks=num_blocks
+    ))
 
-            stub = dn_stub(primary)
+    if not init_resp.ok:
+        print(f'Rechazado por NameNode: {init_resp.message}')
+        sys.exit(1)
 
-            def chunk_gen(block_id, data, pipeline, checksum):
-                offset = 0
-                first  = True
-                while offset < len(data):
-                    end     = min(offset + CHUNK_SIZE, len(data))
-                    piece   = data[offset:end]
-                    is_last = end >= len(data)
-                    yield dfs_pb2.BlockChunk(
-                        block_id    = block_id,
-                        data        = piece,
-                        is_last     = is_last,
-                        checksum    = checksum if is_last else '',
-                        replicate_to= pipeline if first else [],
-                    )
-                    first   = False
-                    offset  = end
+    with open(lp, 'rb') as f:
+        for assignment in init_resp.assignments:
+            block_data = f.read(BLOCK_SIZE)
+            block_checksum = hashlib.sha256(block_data).hexdigest()
+            
+            success = False
+            for target_dn in assignment.datanode_addresses:
+                print(f'  -> Transmitiendo bloque {assignment.block_index} hacia {target_dn}…')
+                try:
+                    def chunk_generator(data=block_data, bid=assignment.block_id,
+                                        pipeline=[a for a in assignment.datanode_addresses if a != target_dn],
+                                        cksum=block_checksum):
+                        offset = 0
+                        while offset < len(data):
+                            end   = min(offset + CHUNK_SIZE, len(data))
+                            chunk = data[offset:end]
+                            offset = end
+                            yield dfs_pb2.BlockChunk(
+                                block_id=bid,
+                                data=chunk,
+                                is_last=(offset >= len(data)),
+                                replicate_to=pipeline,
+                                checksum=cksum
+                            )
 
-            ack = stub.StoreBlock(chunk_gen(block_id, data, pipeline, checksum))
-            if not ack.ok:
-                print(f'  ERROR guardando bloque {assignment.block_index}: {ack.message}')
+                    ack = dn_stub(target_dn).StoreBlock(chunk_generator())
+                    if ack.ok:
+                        success = True
+                        break
+                    else:
+                        print(f'     Rechazado por el nodo: {ack.message}')
+                except Exception as e:
+                    print(f'     Falla de conexión con nodo {target_dn}: {e}')
+
+            if not success:
+                print(f'ERROR Crítico: El bloque {assignment.block_index} no pudo ser replicado.')
                 sys.exit(1)
 
-    print(f'OK – {dfs_path} subido correctamente.')
+    print('OK – Archivo distribuido de forma íntegra.')
 
 def cmd_get(dfs_path: str, local_path: str):
     token = load_token()
-    resp  = nn_stub().GetInfo(dfs_pb2.GetRequest(token=token, filename=dfs_path))
-    if not resp.ok:
-        print(f'Error: {resp.message}')
+    info = nn_stub().GetInfo(dfs_pb2.GetRequest(token=token, filename=dfs_path))
+    if not info.ok:
+        print(f'Error al buscar metadatos: {info.message}')
         sys.exit(1)
 
-    print(f'Descargando {dfs_path} ({resp.file_size} bytes, '
-          f'{len(resp.assignments)} bloque(s))')
-
-    with open(local_path, 'wb') as out:
-        for assignment in sorted(resp.assignments, key=lambda a: a.block_index):
+    with open(local_path, 'wb') as f:
+        for assignment in info.assignments:
             downloaded = False
             for addr in assignment.datanode_addresses:
                 try:
-                    stub  = dn_stub(addr)
-                    total = 0
-                    for chunk in stub.RetrieveBlock(
-                            dfs_pb2.RetrieveRequest(block_id=assignment.block_id)):
-                        out.write(chunk.data)
-                        total += len(chunk.data)
-                    print(f'  Bloque {assignment.block_index} ({total} bytes) ← {addr}')
+                    chunks = dn_stub(addr).RetrieveBlock(dfs_pb2.RetrieveRequest(block_id=assignment.block_id))
+                    temp_block = bytearray()
+                    received_checksum = ''
+                    for c in chunks:
+                        temp_block.extend(c.data)
+                        if c.is_last:
+                            received_checksum = c.checksum
+                    
+                    actual_checksum = hashlib.sha256(temp_block).hexdigest()
+                    if received_checksum and received_checksum != actual_checksum:
+                        print(f'  [WARN] Bloque corrupto recibido desde {addr}. Saltando a otra réplica.')
+                        continue
+                        
+                    f.write(temp_block)
                     downloaded = True
                     break
-                except Exception as e:
-                    print(f'  Fallo en {addr}: {e} – intentando réplica…')
+                except Exception:
+                    continue
             if not downloaded:
-                print(f'  ERROR: no se pudo recuperar bloque {assignment.block_index}')
+                print(f'  ERROR: Imposible recuperar bloque {assignment.block_index}. Clúster corrupto.')
                 sys.exit(1)
 
-    print(f'OK – guardado en {local_path}')
+    print(f'OK – Descargado de forma segura en {local_path}')
 
 def cmd_ls():
     token = load_token()
     resp  = nn_stub().ListDir(dfs_pb2.ListRequest(token=token, path='/'))
     if not resp.ok:
-        print('Error listando archivos')
+        print('Error listando la raíz')
         sys.exit(1)
     if not resp.entries:
-        print('(no hay archivos)')
+        print('(Directorio vacío)')
     for e in resp.entries:
         print(' ', e)
 
@@ -163,15 +157,37 @@ def cmd_rm(dfs_path: str):
     resp  = nn_stub().Remove(dfs_pb2.RemoveRequest(token=token, filename=dfs_path))
     print('OK' if resp.ok else f'Error: {resp.message}')
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
-USAGE = """
-Uso:
-  python cli.py auth <usuario> <contraseña>
-  python cli.py put  <archivo_local> <ruta_dfs>
-  python cli.py get  <ruta_dfs> <archivo_local>
+# Fix Menor: Métodos mkdir y rmdir con validaciones lógicas cruzadas en catálogo
+def cmd_mkdir(dfs_path: str):
+    token = load_token()
+    if not token:
+        print('Error: No autenticado.')
+        sys.exit(1)
+    resp = nn_stub().MakeDir(dfs_pb2.MkdirRequest(token=token, path=dfs_path))
+    print(f'OK – directorio {dfs_path} creado.' if resp.ok else f'Error: {resp.message}')
+
+def cmd_rmdir(dfs_path: str):
+    token = load_token()
+    if not token:
+        print('Error: No autenticado.')
+        sys.exit(1)
+    ls_resp = nn_stub().ListDir(dfs_pb2.ListRequest(token=token, path='/'))
+    if ls_resp.ok:
+        hijos = [e for e in ls_resp.entries if dfs_path.rstrip('/') + '/' in e]
+        if hijos:
+            print(f'Error: El directorio {dfs_path} contiene {len(hijos)} archivo(s) adentro.')
+            sys.exit(1)
+    resp = nn_stub().Remove(dfs_pb2.RemoveRequest(token=token, filename=dfs_path))
+    print(f'OK – directorio {dfs_path} eliminado.' if resp.ok else f'Error: {resp.message}')
+
+USAGE = """Uso:
+  python cli.py auth  <usuario> <contraseña>
+  python cli.py put   <archivo_local> <ruta_dfs>
+  python cli.py get   <ruta_dfs> <archivo_local>
   python cli.py ls
-  python cli.py rm   <ruta_dfs>
-"""
+  python cli.py rm    <ruta_dfs>
+  python cli.py mkdir <ruta_dfs>
+  python cli.py rmdir <ruta_dfs>"""
 
 if __name__ == '__main__':
     args = sys.argv[1:]
@@ -179,16 +195,24 @@ if __name__ == '__main__':
         print(USAGE)
         sys.exit(0)
     cmd = args[0]
-    if cmd == 'auth' and len(args) == 3:
-        cmd_auth(args[1], args[2])
-    elif cmd == 'put' and len(args) == 3:
-        cmd_put(args[1], args[2])
-    elif cmd == 'get' and len(args) == 3:
-        cmd_get(args[1], args[2])
-    elif cmd == 'ls':
-        cmd_ls()
-    elif cmd == 'rm' and len(args) == 2:
-        cmd_rm(args[1])
-    else:
-        print(USAGE)
+    try:
+        if cmd == 'auth' and len(args) == 3:
+            cmd_auth(args[1], args[2])
+        elif cmd == 'put' and len(args) == 3:
+            cmd_put(args[1], args[2])
+        elif cmd == 'get' and len(args) == 3:
+            cmd_get(args[1], args[2])
+        elif cmd == 'ls':
+            cmd_ls()
+        elif cmd == 'rm' and len(args) == 2:
+            cmd_rm(args[1])
+        elif cmd == 'mkdir' and len(args) == 2:
+            cmd_mkdir(args[1])
+        elif cmd == 'rmdir' and len(args) == 2:
+            cmd_rmdir(args[1])
+        else:
+            print(USAGE)
+            sys.exit(1)
+    except grpc.RpcError as e:
+        print(f'Falla de red gRPC [{e.code().name}]: {e.details()}')
         sys.exit(1)
