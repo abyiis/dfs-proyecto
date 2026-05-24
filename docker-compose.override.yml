@@ -1,0 +1,20 @@
+version: '3.9'
+services:
+  namenode:
+    ports:
+      - "50051:50051"
+
+  datanode1:
+    environment:
+      DATANODE_ADDR: "54.210.85.12:50052" # Reemplazar con la IP Pública de AWS de la Instancia 1
+      NAMENODE_ADDR: "3.90.112.45:50051"  # Reemplazar con la IP Pública de la Instancia NameNode
+
+  datanode2:
+    environment:
+      DATANODE_ADDR: "34.201.44.188:50053" # Reemplazar con la IP Pública de AWS de la Instancia 2
+      NAMENODE_ADDR: "3.90.112.45:50051"
+
+  datanode3:
+    environment:
+      DATANODE_ADDR: "52.91.204.3:50054"   # Reemplazar con la IP Pública de AWS de la Instancia 3
+      NAMENODE_ADDR: "3.90.112.45:50051"
