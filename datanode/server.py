@@ -83,7 +83,7 @@ class DataNodeServicer(dfs_pb2_grpc.DataNodeServicer):
                     block_id = chunk.block_id
                     replicate_to = list(chunk.replicate_to)
                     # Arreglo crítico: Archivo temporal único y aislado por hilo
-                    tmp_path = Path(f'/tmp/_dfs_{block_id}_{threading.get_ident()}.tmp')
+                    tmp_path = STORAGE_DIR / f'_tmp_{block_id}_{threading.get_ident()}.tmp'
                     file_handler = open(tmp_path, 'wb')
                 
                 file_handler.write(chunk.data)
